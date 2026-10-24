@@ -1,0 +1,28 @@
+name = "ProtocolProxy"
+uuid = "7d3e1c52-5b1a-4a4e-9c3f-2f8a6b0e9d41"
+authors = ["protocol-proxy contributors"]
+version = "0.1.0"
+
+[deps]
+CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
+
+[compat]
+CodecZlib = "0.7"
+JSON3 = "1"
+PrecompileTools = "1"
+julia = "1.10"
+libsodium_jll = "1.0"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-6c4a3bda6b71"
+
+[targets]
+test = ["Test"]

@@ -1,0 +1,7 @@
+#!/bin/sh
+# The Julia echo proxy: a protocol-proxy process answering PING, SET_LOG_LEVEL and ECHO (PROTOCOL.md).
+# Usage: echo-proxy --proxy-id <hex> --proxy-name <str> --manager-id <hex> [--name value ...]
+#        echo-proxy --self-test [vectors.json]
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(dirname "$here")
+exec julia --project="$repo" --startup-file=no --history-file=no --color=no "$here/echo-proxy.jl" "$@"

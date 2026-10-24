@@ -1,0 +1,7 @@
+[proxy]
+name = "echo-julia"
+command = ["{manifest_dir}/bin/echo-proxy"]
+header_version = 2
+
+[self_test]
+command = ["{manifest_dir}/bin/echo-proxy", "--self-test"]
