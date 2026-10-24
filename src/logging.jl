@@ -1,5 +1,7 @@
-# Log records on stderr (PROTOCOL.md §9): one JSON object per line with the Python LogRecord attribute names when
-# launched by a manager (`_LAUNCHED_BY_PROXY_MANAGER=1`), else readable text for a terminal.
+# Log records (PROTOCOL.md §9, §11a): one JSON object per line on stderr with the Python LogRecord attribute names
+# when launched by a manager (`_LAUNCHED_BY_PROXY_MANAGER=1`), else readable text for a terminal. After registration
+# a proxy launched with stderr a pipe switches the logger to a bounded, rate-limited `LogQueue`, which the proxy ships
+# in `LOG` batches over the socket (see `start_socket_logging!` in proxy.jl); at exit the queue is drained to stderr.
 
 const LAUNCHED_BY_MANAGER_ENV = "_LAUNCHED_BY_PROXY_MANAGER"
 
@@ -29,6 +31,73 @@ function julia_level(levelno::Integer)
 end
 
 """
+    LogQueue(; max_len=2000, rate=50.0, burst=200)
+
+Records waiting to be shipped in `LOG` batches (§9, §11a). `emit!` never blocks and never does I/O: the queue is
+bounded and token-bucket rate-limited (`rate` records per second sustained, `burst` at once); records beyond either
+limit are dropped and counted, and the count travels in the next batch as `dropped`.
+"""
+mutable struct LogQueue
+    records::Vector{Dict{String,Any}}
+    max_len::Int
+    rate::Float64
+    burst::Int
+    tokens::Float64
+    refilled::Float64
+    dropped::Int
+    total_dropped::Int
+    lock::ReentrantLock
+end
+
+LogQueue(; max_len::Integer=2000, rate::Real=50.0, burst::Integer=200) =
+    LogQueue(Dict{String,Any}[], Int(max_len), Float64(rate), Int(burst), Float64(burst), time(), 0, 0, ReentrantLock())
+
+function take_token!(q::LogQueue)
+    now = time()
+    q.tokens = min(Float64(q.burst), q.tokens + (now - q.refilled) * q.rate)
+    q.refilled = now
+    q.tokens >= 1 || return false
+    q.tokens -= 1
+    return true
+end
+
+"""Queue a record, or count it as dropped. Returns whether it was queued."""
+function emit!(q::LogQueue, fields::Dict{String,Any})
+    lock(q.lock) do
+        if length(q.records) >= q.max_len || !take_token!(q)
+            q.dropped += 1
+            q.total_dropped += 1
+            return false
+        end
+        push!(q.records, fields)
+        return true
+    end
+end
+
+Base.length(q::LogQueue) = lock(() -> length(q.records), q.lock)
+Base.isempty(q::LogQueue) = length(q) == 0
+
+"""
+    drain!(q, limit=0) -> (records, dropped)
+
+Take up to `limit` queued records (all when `limit <= 0`) and the count dropped since the last drain.
+"""
+function drain!(q::LogQueue, limit::Integer=0)
+    lock(q.lock) do
+        n = limit > 0 ? min(Int(limit), length(q.records)) : length(q.records)
+        taken = q.records[1:n]
+        deleteat!(q.records, 1:n)
+        dropped = q.dropped
+        q.dropped = 0
+        return taken, dropped
+    end
+end
+
+"""The payload of a `LOG` message: `{"records": [...], "dropped": n}`."""
+batch_payload(records::AbstractVector, dropped::Integer) =
+    Vector{UInt8}(codeunits(JSON3.write(Dict{String,Any}("records" => records, "dropped" => Int(dropped)))))
+
+"""
     ProxyLogger(; levelno=20, json=launched_by_manager(), stream=stderr)
 
 The process logger: JSON lines (`name`, `levelno`, `levelname`, `pathname`, `lineno`, `funcName`, `created`,
@@ -40,12 +109,24 @@ mutable struct ProxyLogger <: Logging.AbstractLogger
     json::Bool
     stream::IO
     lock::ReentrantLock
+    #: the LOG queue while records travel over the socket, else nothing (records go to `stream`)
+    queue::Union{Nothing,LogQueue}
 end
 
 launched_by_manager() = get(ENV, LAUNCHED_BY_MANAGER_ENV, "") != ""
 
+"""Whether this process should use the JSON channel toward a manager: launched by one, with stderr a pipe."""
+function stderr_is_pipe()
+    io = stderr
+    while io isa IOContext            # `julia --color=no` wraps the standard streams
+        io = io.io
+    end
+    return io isa Base.PipeEndpoint
+end
+use_json_channel() = launched_by_manager() && stderr_is_pipe()
+
 ProxyLogger(; levelno::Integer=20, json::Bool=launched_by_manager(), stream::IO=stderr) =
-    ProxyLogger(Int(levelno), json, stream, ReentrantLock())
+    ProxyLogger(Int(levelno), json, stream, ReentrantLock(), nothing)
 
 Logging.min_enabled_level(l::ProxyLogger) = julia_level(l.levelno)
 Logging.shouldlog(l::ProxyLogger, level, _module, group, id) = python_levelno(level) >= l.levelno
@@ -89,15 +170,25 @@ function format_exception(v)
     return String(take!(io))
 end
 
+"""One record as a JSON line on `io` (what a manager reads from stderr)."""
+function write_json_line(io::IO, fields::AbstractDict)
+    println(io, JSON3.write(fields))
+    return
+end
+
 function Logging.handle_message(l::ProxyLogger, level, message, _module, group, id, file, line; kwargs...)
     fields = record_fields(level, message, _module, file, line; kwargs...)
+    queue = l.queue
+    if queue !== nothing
+        emit!(queue, fields)
+        return nothing
+    end
+    # One write per record, so lines from several Tasks (and from a manager's proxies on the same fd) do not interleave.
+    line = l.json ? JSON3.write(fields) * "\n" :
+        string(fields["levelname"], " ", fields["name"], ": ", fields["msg"],
+               fields["exc_text"] === nothing ? "" : "\n" * fields["exc_text"], "\n")
     lock(l.lock) do
-        if l.json
-            println(l.stream, JSON3.write(fields))
-        else
-            println(l.stream, fields["levelname"], " ", fields["name"], ": ", fields["msg"],
-                    fields["exc_text"] === nothing ? "" : "\n" * fields["exc_text"])
-        end
+        write(l.stream, line)
         flush(l.stream)
     end
     return nothing

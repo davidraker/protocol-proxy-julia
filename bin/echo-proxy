@@ -4,4 +4,6 @@
 #        echo-proxy --self-test [vectors.json]
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(dirname "$here")
-exec julia --project="$repo" --startup-file=no --history-file=no --color=no "$here/echo-proxy.jl" "$@"
+# --handle-signals=no: Julia's own signal thread must not see SIGTERM (see README, "SIGTERM in Julia"); the proxy
+# installs its handlers itself. Keep the process single-threaded (no -t), as Julia's GC needs its handlers for more.
+exec julia --project="$repo" --startup-file=no --history-file=no --color=no --handle-signals=no "$here/echo-proxy.jl" "$@"

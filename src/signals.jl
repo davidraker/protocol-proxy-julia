@@ -1,10 +1,13 @@
 # SIGTERM (PROTOCOL.md §1): the manager stops a proxy with SIGTERM and expects exit code 0.
 #
-# Julia blocks SIGTERM on its threads and consumes it on a dedicated signal thread, where it is fatal (a backtrace
-# and exit code 143), so neither a libuv signal watcher nor `signal(2)` alone sees it. Unblocking SIGTERM on the main
-# thread and installing a sigaction handler there works: Linux delivers a process-directed signal to the main thread
-# first when that thread does not block it. The handler only stores the signal number into pre-allocated memory; a
-# Task polls that word.
+# With its default handlers Julia blocks SIGTERM on its threads and consumes it on a dedicated signal thread, where it
+# is fatal (a backtrace and death by the signal), so neither a libuv signal watcher nor `signal(2)` alone sees it.
+# Unblocking SIGTERM on the main thread and installing a sigaction handler there mostly works, because Linux offers a
+# process-directed signal to the main thread first, but not always: a main thread that is off-CPU with another signal
+# pending is skipped and Julia's thread gets it (seen as a rare exit code -15 under the conformance harness). So
+# `bin/echo-proxy` runs Julia with `--handle-signals=no`: no signal thread, nothing blocked, and the handler below is
+# the only one. The handler only stores the signal number into pre-allocated memory; a Task polls that word. Without
+# Julia's handlers SIGPIPE has its default (fatal) disposition, so it is ignored here as Julia would have.
 
 const _SIGTERM = Cint(15)
 const _SIGINT = Cint(2)
@@ -16,9 +19,13 @@ function _signal_handler(sig::Cint)
     return nothing
 end
 
-"""Install the SIGTERM handler; returns false (and logs) where that is not possible (not Linux x86_64/aarch64)."""
+const _SIGPIPE = Cint(13)
+const _SIG_IGN = Ptr{Cvoid}(1)
+
+"""Install the SIGTERM handler (and ignore SIGPIPE); returns false (and logs) where that is not possible (not Linux x86_64/aarch64)."""
 function install_signal_handlers()
     Sys.islinux() || return false
+    ccall(:signal, Ptr{Cvoid}, (Cint, Ptr{Cvoid}), _SIGPIPE, _SIG_IGN)
     if _SIGNAL_FLAG[] == C_NULL
         p = Ptr{Int64}(Libc.malloc(8))
         unsafe_store!(p, 0)

@@ -1,20 +1,27 @@
 # The IPC connector (PROTOCOL.md §2, §6): a TCP listener and dialer, authentication of frames by sender id and
 # token, dispatch by (method, remote_id) then method, RESPONSE matching by request id, per-message and persistent
-# connections in both directions. One Task per connection.
+# connections in both directions, over TCP or TLS (tls.jl). One Task per connection.
 
 mutable struct Connection
-    sock::TCPSocket
+    sock::IO                      # a TCPSocket, or an OpenSSL.SSLStream over one
     persistent::Bool
     peer_id::Union{Nothing,UUID}
     write_lock::ReentrantLock
     pending::Set{UInt32}          # request ids awaiting responses on this connection
     closed::Bool
+    #: the common name of the certificate the other end presented (its id as hex), nothing on a plain connection
+    tls_peer::Union{Nothing,String}
+    #: ordinary writers waiting for or holding the write lock; low-priority writers (LOG batches) yield to them
+    urgent::Threads.Atomic{Int}
 end
 
-Connection(sock::TCPSocket; persistent::Bool=false, peer_id::Union{Nothing,UUID}=nothing) =
-    Connection(sock, persistent, peer_id, ReentrantLock(), Set{UInt32}(), false)
+Connection(sock::IO; persistent::Bool=false, peer_id::Union{Nothing,UUID}=nothing, tls_peer::Union{Nothing,String}=nothing) =
+    Connection(sock, persistent, peer_id, ReentrantLock(), Set{UInt32}(), false, tls_peer, Threads.Atomic{Int}(0))
 
 alive(c::Connection) = !c.closed && isopen(c.sock)
+
+"""The TCP socket under a connection (the SSLStream's, when TLS)."""
+raw_socket(c::Connection) = c.sock isa OpenSSL.SSLStream ? c.sock.io : c.sock
 
 function Base.close(c::Connection)
     c.closed && return
@@ -42,11 +49,13 @@ mutable struct Peer
     key::Union{Nothing,Vector{UInt8}}
     connect_lock::ReentrantLock
     last_seen::Union{Nothing,Float64}
+    #: every connection with this peer is TLS, mutually verified against the manager's CA
+    tls::Bool
 end
 
 Peer(proxy_id::UUID, token::UUID; address=nothing, name=string(proxy_id), persistent=nothing, features=String[],
-     key=nothing) = Peer(proxy_id, token, address, String(name), persistent, nothing, Vector{String}(features),
-                         key === nothing ? nothing : Vector{UInt8}(key), ReentrantLock(), nothing)
+     key=nothing, tls::Bool=false) = Peer(proxy_id, token, address, String(name), persistent, nothing, Vector{String}(features),
+                                          key === nothing ? nothing : Vector{UInt8}(key), ReentrantLock(), nothing, tls)
 
 struct Callback
     f::Function                   # f(connector, header, payload::Vector{UInt8}) -> Nothing | Vector{UInt8} | String
@@ -127,46 +136,58 @@ mutable struct Connector
     stopping::Bool
     accept_task::Union{Nothing,Task}
     lock::ReentrantLock
+    #: TLS material makes every accepted connection TLS and lets this end dial TLS peers; nothing for plain TCP
+    tls::Union{Nothing,TlsMaterial}
+    server_ctx::Union{Nothing,OpenSSL.SSLContext}
+    client_ctx::Union{Nothing,OpenSSL.SSLContext}
+    #: with material, also accept plain connections, telling them apart by the first byte (a manager's listener, §11b)
+    tls_optional::Bool
 end
 
 const KEEPALIVE_DELAY = 15
 
 """
     Connector(proxy_id, token; name, inbound_address="localhost", inbound_port=nothing, persistent=false,
-              compress_threshold=4096, persistent_max_frame=262144, cipher="auto", features=[...])
+              compress_threshold=4096, persistent_max_frame=262144, cipher="auto", features=[...], tls=nothing,
+              tls_optional=false)
+
+With `tls`, accepted connections are TLS (and plain ones are refused) unless `tls_optional`, which serves plain and TLS
+connections on the one port by their first byte (0x16 opens a TLS record; a frame's version word starts with 0x00),
+as the Python manager's listener does. Dialled connections are TLS toward peers marked `tls` either way.
 """
 function Connector(proxy_id::UUID, token::UUID; name::AbstractString=string(proxy_id), inbound_address::AbstractString="localhost",
                    inbound_port::Union{Nothing,Integer}=nothing, min_port::Integer=22801, max_port::Integer=22899,
                    persistent::Bool=false, compress_threshold::Integer=COMPRESS_THRESHOLD,
                    persistent_max_frame::Integer=PERSISTENT_MAX_FRAME, cipher::AbstractString="auto",
-                   features::AbstractVector{<:AbstractString}=default_features())
+                   features::AbstractVector{<:AbstractString}=default_features(), tls::Union{Nothing,TlsMaterial}=nothing,
+                   tls_optional::Bool=false)
     c = Connector(proxy_id, token, String(name), String(inbound_address), inbound_port === nothing ? nothing : Int(inbound_port),
                   Int(min_port), Int(max_port), nothing, nothing, Dict{UUID,Peer}(), Dict{String,Callback}(),
                   Dict{Tuple{String,UUID},Callback}(), Dict{UInt32,Pending}(), Dict(1 => UInt32(1), 2 => UInt32(1)),
                   Set{Connection}(), persistent, Int(persistent_max_frame), Int(compress_threshold),
-                  resolve_cipher(cipher), Vector{String}(features), time(), nothing, false, nothing, ReentrantLock())
+                  resolve_cipher(cipher), Vector{String}(features), time(), nothing, false, nothing, ReentrantLock(),
+                  tls, nothing, nothing, tls_optional)
+    if tls !== nothing
+        c.server_ctx = ssl_context(tls, true)       # fails now, not at the first connection, if the material is bad
+        c.client_ctx = ssl_context(tls, false)
+    end
     register_callback!(c, handle_response, "RESPONSE")
     return c
 end
 
-"""What this connector advertises: compression and the AEADs libsodium can do here."""
-function default_features()
-    features = [FEATURE_COMPRESS, FEATURE_CHACHA]
-    aes_gcm_available() && push!(features, FEATURE_AES_GCM)
-    return features
-end
+"""What this connector advertises: compression and both AEADs (OpenSSL has them on every CPU)."""
+default_features() = [FEATURE_COMPRESS, FEATURE_CHACHA, FEATURE_AES_GCM]
 
-"""The cipher for a configuration value: a known name, or `auto` (AES-256-GCM when the CPU has it, else ChaCha20)."""
+"""
+The cipher for a configuration value: a known name, or `auto` (§11a: AES-256-GCM when `/proc/cpuinfo` lists the
+`aes` flag, so that hardware does the work, else ChaCha20-Poly1305; both are always available).
+"""
 function resolve_cipher(cipher::AbstractString)
     c = lowercase(strip(cipher))
     if c in ("", "auto")
-        return aes_gcm_available() ? CIPHER_AES_GCM : CIPHER_CHACHA
+        return cpu_has_aes() ? CIPHER_AES_GCM : CIPHER_CHACHA
     end
     haskey(CIPHERS, c) || throw(ArgumentError("Unknown cipher $(repr(cipher)); choose from $(join(keys(CIPHERS), ", ")) or auto."))
-    if c == CIPHER_AES_GCM && !aes_gcm_available()
-        @warn "AES-256-GCM is not available on this CPU; using $CIPHER_CHACHA"
-        return CIPHER_CHACHA
-    end
     return c
 end
 
@@ -176,6 +197,17 @@ function cipher_for(c::Connector, peer::Union{Nothing,Peer})
         return CIPHER_CHACHA
     end
     return c.cipher
+end
+
+"""Whether `/proc/cpuinfo` lists the `aes` flag (false where there is no such file)."""
+function cpu_has_aes()
+    isfile("/proc/cpuinfo") || return false
+    for line in eachline("/proc/cpuinfo")
+        if startswith(line, "flags") || startswith(line, "Features")
+            return occursin(r"\baes\b", line)
+        end
+    end
+    return false
 end
 
 # ---- callbacks -----------------------------------------------------------------------------------------------------
@@ -318,23 +350,70 @@ function accept_loop(c::Connector)
         end
         conn = Connection(sock)
         push!(c.connections, conn)
-        @async serve(c, conn)
+        if c.tls === nothing
+            @async serve(c, conn)
+        elseif c.tls_optional
+            @async serve_sniffed(c, conn)
+        else
+            @async tls_accept!(c, conn) && serve(c, conn)
+        end
+    end
+end
+
+"""
+Serve an accepted connection that may be TLS or plain: wait for its first byte without consuming it (it stays in the
+socket's buffer for OpenSSL or the frame reader), 0x16 being a TLS ClientHello record and 0x00 a frame's version word.
+"""
+function serve_sniffed(c::Connector, conn::Connection)
+    sock = conn.sock::TCPSocket
+    closed = try
+        eof(sock)
+    catch
+        true
+    end
+    if closed
+        connection_lost!(c, conn, "closed before any data")
+        return
+    end
+    if Base.peek(sock.buffer) == 0x16
+        tls_accept!(c, conn) || return
+    end
+    serve(c, conn)
+end
+
+"""Complete the TLS handshake on an accepted connection (the listener is TLS-only with material). False if dropped."""
+function tls_accept!(c::Connector, conn::Connection)
+    ssl = OpenSSL.SSLStream(c.server_ctx, conn.sock::TCPSocket)
+    conn.sock = ssl
+    try
+        conn.tls_peer = tls_handshake!(ssl, true)
+        return true
+    catch e
+        c.stopping || @warn "$(c.name): TLS handshake with an accepted connection failed: $(sprint(showerror, e))"
+        connection_lost!(c, conn, "TLS handshake failed")
+        return false
     end
 end
 
 # ---- receiving -----------------------------------------------------------------------------------------------------
 
-function read_exact(sock::TCPSocket, n::Integer)
+"""Exactly `n` bytes from `io`, or nothing at EOF."""
+function read_exact(io::IO, n::Integer)
     n == 0 && return UInt8[]
-    data = read(sock, n)
-    length(data) == n || return nothing
+    data = Vector{UInt8}(undef, n)
+    try
+        GC.@preserve data unsafe_read(io, pointer(data), UInt(n))
+    catch e
+        e isa EOFError && return nothing
+        rethrow()
+    end
     return data
 end
 
 """
-    read_frame(sock) -> (header, raw_header, wire_payload) or nothing at EOF
+    read_frame(io) -> (header, raw_header, wire_payload) or nothing at EOF
 """
-function read_frame(sock::TCPSocket)
+function read_frame(sock::IO)
     version_bytes = read_exact(sock, VERSION_WORD_BYTES)
     version_bytes === nothing && return nothing
     version = peek_version(version_bytes)
@@ -372,10 +451,28 @@ function make_persistent!(conn::Connection, peer_id::Union{Nothing,UUID})
     conn.persistent = true
     conn.peer_id = peer_id
     try
-        ccall(:uv_tcp_keepalive, Cint, (Ptr{Cvoid}, Cint, Cuint), conn.sock.handle, 1, KEEPALIVE_DELAY)
+        ccall(:uv_tcp_keepalive, Cint, (Ptr{Cvoid}, Cint, Cuint), raw_socket(conn).handle, 1, KEEPALIVE_DELAY)
     catch
     end
     return
+end
+
+"""
+A frame is accepted only if its transport identity matches its claimed identity (§6): over TLS the sender id must
+be the certificate's common name; a peer marked TLS must not arrive in the clear.
+"""
+function frame_identity_ok(c::Connector, conn::Connection, h::Header)
+    if conn.tls_peer !== nothing
+        uuid_hex(h.sender_id) == conn.tls_peer && return true
+        @warn "$(c.name): frame from $(h.sender_id) over a TLS connection authenticated as $(conn.tls_peer); dropped"
+        return false
+    end
+    peer = get(c.peers, h.sender_id, nothing)
+    if peer !== nothing && peer.tls
+        @warn "$(c.name): clear-text frame from $(h.sender_id), who must use TLS; dropped"
+        return false
+    end
+    return true
 end
 
 """Serve frames on a connection until EOF (or until this side closes it)."""
@@ -405,6 +502,7 @@ Handle one received frame. Returns whether the connection should go on being ser
 connection that has been answered, or a frame that had to be refused).
 """
 function process_frame(c::Connector, conn::Connection, h::Header, raw::Vector{UInt8}, wire::Vector{UInt8})
+    frame_identity_ok(c, conn, h) || return conn.persistent
     if !authenticated(c, h)
         @warn "$(c.name): dropping $(h.method_name) from unauthenticated sender $(h.sender_id)"
         h.response_expected && reply(c, conn, h, UInt8[])
@@ -508,9 +606,27 @@ function frame_bytes(c::Connector, msg::Message, peer::Union{Nothing,Peer}; keep
     return vcat(raw, wire)
 end
 
-function write_frame(conn::Connection, bytes::Vector{UInt8})
-    lock(conn.write_lock) do
-        write(conn.sock, bytes)
+"""
+Write a frame. A `low_priority` frame (a LOG batch, §9) waits up to half a second for ordinary writers to finish
+first, so logging rides in the gaps of protocol traffic on a persistent connection instead of ahead of it.
+"""
+function write_frame(conn::Connection, bytes::Vector{UInt8}; low_priority::Bool=false)
+    if low_priority
+        deadline = time() + 0.5
+        while conn.urgent[] > 0 && alive(conn) && time() < deadline
+            sleep(0.001)
+        end
+    else
+        Threads.atomic_add!(conn.urgent, 1)
+    end
+    try
+        lock(conn.write_lock) do
+            alive(conn) || throw(Base.IOError("connection closed", 0))
+            write(conn.sock, bytes)
+            conn.sock isa OpenSSL.SSLStream && flush(conn.sock)
+        end
+    finally
+        low_priority || Threads.atomic_sub!(conn.urgent, 1)
     end
     return
 end
@@ -518,14 +634,14 @@ end
 is_persistent(c::Connector, peer::Peer) = peer.persistent === nothing ? c.persistent : peer.persistent
 
 """
-    send_message(c, peer, msg) -> Pending | true | false
+    send_message(c, peer, msg; low_priority=false) -> Pending | true | false
 
 Send a message. Returns a `Pending` when a response is expected, `true` when the frame was handed to a connection
 (or a dial Task), `false` when it cannot be attempted. An open persistent connection to the peer is used when
 there is one; otherwise a persistent peer gets one dialled and any other peer gets a connection for this message
 alone. A frame above `persistent_max_frame` takes its own connection when the peer's address is known.
 """
-function send_message(c::Connector, peer::Peer, msg::Message)
+function send_message(c::Connector, peer::Peer, msg::Message; low_priority::Bool=false)
     address = peer.address
     link = peer.connection !== nothing && alive(peer.connection) ? peer.connection : nothing
     if address === nothing && link === nothing
@@ -554,7 +670,7 @@ function send_message(c::Connector, peer::Peer, msg::Message)
     try
         conn = link_to(c, peer, address)
         msg.response_expected && push!(conn.pending, msg.request_id)
-        write_frame(conn, frame)
+        write_frame(conn, frame; low_priority)
     catch e
         c.stopping || @warn "$(c.name): unable to send $(msg.method_name) (request $(msg.request_id)) to $(peer.proxy_id): $e"
         msg.response_expected && fail_pending!(c, [msg.request_id], ErrorException("$(msg.method_name) to $(peer.proxy_id): $e"))
@@ -564,9 +680,27 @@ end
 
 const CONNECT_TIMEOUT = 30.0
 
-function dial(address::Tuple{String,Int})
+"""
+Dial a peer: plain TCP, or TLS when the peer is a TLS peer (this end then needs material; the certificate must
+chain to the CA and name the peer). Returns a `Connection` with `tls_peer` set when TLS.
+"""
+function dial(c::Connector, peer::Union{Nothing,Peer}, address::Tuple{String,Int}; persistent::Bool=false)
     ip = resolve_ipv4(address[1])
-    return Sockets.connect(ip, address[2])
+    sock = Sockets.connect(ip, address[2])
+    (peer === nothing || !peer.tls) && return Connection(sock; persistent, peer_id=persistent ? peer.proxy_id : nothing)
+    if c.tls === nothing
+        close(sock)
+        error("$(peer.proxy_id) requires TLS but this end has no TLS material")
+    end
+    ssl = OpenSSL.SSLStream(c.client_ctx, sock)
+    expect = uuid_hex(peer.proxy_id)
+    cn = try
+        tls_handshake!(ssl, false; expect, server_name=expect)
+    catch e
+        close(ssl)
+        rethrow()
+    end
+    return Connection(ssl; persistent, peer_id=persistent ? peer.proxy_id : nothing, tls_peer=cn)
 end
 
 """Dial a connection for this message alone: write the frame, read the reply if one is expected, close."""
@@ -575,13 +709,12 @@ function deliver(c::Connector, address::Tuple{String,Int}, msg::Message, peer::U
     attempts = 5
     while attempts > 0
         try
-            sock = dial(address)
-            conn = Connection(sock)
+            conn = dial(c, peer, address)
             push!(c.connections, conn)
             write_frame(conn, frame_bytes(c, msg, peer; keep_alive=false))
             if msg.response_expected
                 push!(conn.pending, msg.request_id)
-                frame = read_frame(sock)
+                frame = read_frame(conn.sock)
                 if frame === nothing
                     @warn "$(c.name): $(address) closed the connection without answering $(msg.method_name) (request $(msg.request_id))"
                     fail_pending!(c, [msg.request_id], ErrorException("$(address) closed the connection without answering $(msg.method_name)"))
@@ -615,8 +748,7 @@ function link_to(c::Connector, peer::Peer, address::Union{Nothing,Tuple{String,I
         conn = peer.connection
         (conn !== nothing && alive(conn)) && return conn
         address === nothing && error("no open connection to $(peer.proxy_id) and no address to dial")
-        sock = dial(address)
-        conn = Connection(sock; persistent=true, peer_id=peer.proxy_id)
+        conn = dial(c, peer, address; persistent=true)
         make_persistent!(conn, peer.proxy_id)
         push!(c.connections, conn)
         peer.connection = conn

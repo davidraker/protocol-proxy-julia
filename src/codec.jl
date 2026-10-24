@@ -1,5 +1,6 @@
 # Payload transforms (PROTOCOL.md §4 and §5): zlib compression behind bit 1, AEAD encryption behind bit 2
-# (ChaCha20-Poly1305, or AES-256-GCM with bit 4). The AEADs come from libsodium (libsodium_jll).
+# (ChaCha20-Poly1305, or AES-256-GCM with bit 4). Both AEADs come from OpenSSL's EVP interface (OpenSSL_jll), so
+# AES-256-GCM is available on every CPU (in software where there is no hardware AES).
 
 const KEY_BYTES = 32
 const NONCE_BYTES = 12
@@ -20,20 +21,48 @@ struct AuthenticationError <: Exception
 end
 Base.showerror(io::IO, e::AuthenticationError) = print(io, "AuthenticationError: ", e.msg)
 
-const _sodium_ready = Ref(false)
+"""Whether AES-256-GCM can be used here. Always true with OpenSSL (kept for callers written against libsodium)."""
+aes_gcm_available() = true
 
-function sodium_init(; force::Bool=false)
-    _sodium_ready[] && !force && return
-    rc = ccall((:sodium_init, libsodium), Cint, ())
-    rc >= 0 || error("sodium_init failed ($rc)")
-    _sodium_ready[] = true
-    return
+# EVP_CIPHER_CTX_ctrl commands (openssl/evp.h)
+const EVP_CTRL_AEAD_SET_IVLEN = Cint(0x9)
+const EVP_CTRL_AEAD_GET_TAG = Cint(0x10)
+const EVP_CTRL_AEAD_SET_TAG = Cint(0x11)
+
+evp_aead(aes_gcm::Bool) = aes_gcm ? ccall((:EVP_aes_256_gcm, libcrypto), Ptr{Cvoid}, ()) :
+                                    ccall((:EVP_chacha20_poly1305, libcrypto), Ptr{Cvoid}, ())
+
+function openssl_error_text(what::AbstractString)
+    code = ccall((:ERR_get_error, libcrypto), Culong, ())
+    code == 0 && return what
+    buf = Vector{UInt8}(undef, 256)
+    ccall((:ERR_error_string_n, libcrypto), Cvoid, (Culong, Ptr{UInt8}, Csize_t), code, buf, length(buf))
+    return what * ": " * unsafe_string(pointer(buf))
 end
 
-"""Whether libsodium can do AES-256-GCM on this CPU (it needs hardware AES instructions)."""
-function aes_gcm_available()
-    sodium_init()
-    return ccall((:crypto_aead_aes256gcm_is_available, libsodium), Cint, ()) == 1
+evp_init(ctx::Ptr{Cvoid}, encrypt::Bool, cipher::Ptr{Cvoid}, key, nonce) = encrypt ?
+    ccall((:EVP_EncryptInit_ex, libcrypto), Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}), ctx, cipher, C_NULL, key, nonce) :
+    ccall((:EVP_DecryptInit_ex, libcrypto), Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}), ctx, cipher, C_NULL, key, nonce)
+
+"""Run `f(ctx)` with a fresh EVP_CIPHER_CTX initialised for the AEAD, key and nonce; the context is always freed."""
+function with_aead_context(f, key::Vector{UInt8}, nonce::Vector{UInt8}, encrypt::Bool, aes_gcm::Bool)
+    ctx = ccall((:EVP_CIPHER_CTX_new, libcrypto), Ptr{Cvoid}, ())
+    ctx == C_NULL && error(openssl_error_text("EVP_CIPHER_CTX_new failed"))
+    try
+        evp_init(ctx, encrypt, evp_aead(aes_gcm), C_NULL, C_NULL) == 1 || error(openssl_error_text("AEAD init failed"))
+        ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint, (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}),
+              ctx, EVP_CTRL_AEAD_SET_IVLEN, NONCE_BYTES, C_NULL) == 1 || error(openssl_error_text("AEAD nonce length refused"))
+        evp_init(ctx, encrypt, C_NULL, key, nonce) == 1 || error(openssl_error_text("AEAD key/nonce refused"))
+        return f(ctx)
+    finally
+        ccall((:EVP_CIPHER_CTX_free, libcrypto), Cvoid, (Ptr{Cvoid},), ctx)
+    end
+end
+
+function check_aead_args(key, nonce)
+    length(key) == KEY_BYTES || throw(ArgumentError("the key must be $KEY_BYTES bytes"))
+    length(nonce) == NONCE_BYTES || throw(ArgumentError("the nonce must be $NONCE_BYTES bytes"))
+    return Vector{UInt8}(key), Vector{UInt8}(nonce)
 end
 
 compress(data::AbstractVector{UInt8}) = transcode(ZlibCompressor, Vector{UInt8}(data))
@@ -46,24 +75,30 @@ Encrypt with ChaCha20-Poly1305 (IETF, 12-byte nonce) or AES-256-GCM; the result 
 """
 function aead_encrypt(key::AbstractVector{UInt8}, nonce::AbstractVector{UInt8}, plaintext::AbstractVector{UInt8},
                       ad::AbstractVector{UInt8}; aes_gcm::Bool=false)
-    sodium_init()
-    length(key) == KEY_BYTES || throw(ArgumentError("the key must be $KEY_BYTES bytes"))
-    length(nonce) == NONCE_BYTES || throw(ArgumentError("the nonce must be $NONCE_BYTES bytes"))
-    key, nonce, plaintext, ad = Vector{UInt8}(key), Vector{UInt8}(nonce), Vector{UInt8}(plaintext), Vector{UInt8}(ad)
+    key, nonce = check_aead_args(key, nonce)
+    plaintext, ad = Vector{UInt8}(plaintext), Vector{UInt8}(ad)
     out = Vector{UInt8}(undef, length(plaintext) + TAG_BYTES)
-    outlen = Ref{Culonglong}(0)
-    rc = if aes_gcm
-        aes_gcm_available() || error("AES-256-GCM is not available on this CPU")
-        ccall((:crypto_aead_aes256gcm_encrypt, libsodium), Cint,
-              (Ptr{UInt8}, Ptr{Culonglong}, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}),
-              out, outlen, plaintext, length(plaintext), ad, length(ad), C_NULL, nonce, key)
-    else
-        ccall((:crypto_aead_chacha20poly1305_ietf_encrypt, libsodium), Cint,
-              (Ptr{UInt8}, Ptr{Culonglong}, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}),
-              out, outlen, plaintext, length(plaintext), ad, length(ad), C_NULL, nonce, key)
+    outlen = Ref{Cint}(0)
+    with_aead_context(key, nonce, true, aes_gcm) do ctx
+        GC.@preserve out plaintext ad begin
+            if !isempty(ad)
+                ccall((:EVP_EncryptUpdate, libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{Cint}, Ptr{UInt8}, Cint),
+                      ctx, C_NULL, outlen, ad, length(ad)) == 1 || error(openssl_error_text("AEAD associated data refused"))
+            end
+            n = 0
+            if !isempty(plaintext)
+                ccall((:EVP_EncryptUpdate, libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{Cint}, Ptr{UInt8}, Cint),
+                      ctx, pointer(out), outlen, plaintext, length(plaintext)) == 1 || error(openssl_error_text("AEAD encryption failed"))
+                n = Int(outlen[])
+            end
+            ccall((:EVP_EncryptFinal_ex, libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{Cint}),
+                  ctx, pointer(out) + n, outlen) == 1 || error(openssl_error_text("AEAD encryption failed"))
+            n += Int(outlen[])
+            n == length(plaintext) || error("AEAD produced $n bytes for $(length(plaintext)) of plaintext")
+            ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint, (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}),
+                  ctx, EVP_CTRL_AEAD_GET_TAG, TAG_BYTES, pointer(out) + n) == 1 || error(openssl_error_text("AEAD tag unavailable"))
+        end
     end
-    rc == 0 || error("AEAD encryption failed ($rc)")
-    resize!(out, Int(outlen[]))
     return out
 end
 
@@ -74,25 +109,35 @@ Throws `AuthenticationError` when the tag does not verify.
 """
 function aead_decrypt(key::AbstractVector{UInt8}, nonce::AbstractVector{UInt8}, ciphertext::AbstractVector{UInt8},
                       ad::AbstractVector{UInt8}; aes_gcm::Bool=false)
-    sodium_init()
-    length(key) == KEY_BYTES || throw(ArgumentError("the key must be $KEY_BYTES bytes"))
-    length(nonce) == NONCE_BYTES || throw(ArgumentError("the nonce must be $NONCE_BYTES bytes"))
+    key, nonce = check_aead_args(key, nonce)
     length(ciphertext) >= TAG_BYTES || throw(AuthenticationError("ciphertext shorter than the tag"))
-    key, nonce, ciphertext, ad = Vector{UInt8}(key), Vector{UInt8}(nonce), Vector{UInt8}(ciphertext), Vector{UInt8}(ad)
-    out = Vector{UInt8}(undef, length(ciphertext) - TAG_BYTES)
-    outlen = Ref{Culonglong}(0)
-    rc = if aes_gcm
-        aes_gcm_available() || throw(AuthenticationError("AES-256-GCM is not available on this CPU"))
-        ccall((:crypto_aead_aes256gcm_decrypt, libsodium), Cint,
-              (Ptr{UInt8}, Ptr{Culonglong}, Ptr{UInt8}, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Ptr{UInt8}),
-              out, outlen, C_NULL, ciphertext, length(ciphertext), ad, length(ad), nonce, key)
-    else
-        ccall((:crypto_aead_chacha20poly1305_ietf_decrypt, libsodium), Cint,
-              (Ptr{UInt8}, Ptr{Culonglong}, Ptr{UInt8}, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Culonglong, Ptr{UInt8}, Ptr{UInt8}),
-              out, outlen, C_NULL, ciphertext, length(ciphertext), ad, length(ad), nonce, key)
+    ciphertext, ad = Vector{UInt8}(ciphertext), Vector{UInt8}(ad)
+    body_len = length(ciphertext) - TAG_BYTES
+    out = Vector{UInt8}(undef, body_len)
+    outlen = Ref{Cint}(0)
+    ok = with_aead_context(key, nonce, false, aes_gcm) do ctx
+        GC.@preserve out ciphertext ad begin
+            if !isempty(ad)
+                ccall((:EVP_DecryptUpdate, libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{Cint}, Ptr{UInt8}, Cint),
+                      ctx, C_NULL, outlen, ad, length(ad)) == 1 || error(openssl_error_text("AEAD associated data refused"))
+            end
+            n = 0
+            if body_len > 0
+                ccall((:EVP_DecryptUpdate, libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{Cint}, Ptr{UInt8}, Cint),
+                      ctx, pointer(out), outlen, pointer(ciphertext), body_len) == 1 || error(openssl_error_text("AEAD decryption failed"))
+                n = Int(outlen[])
+            end
+            ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint, (Ptr{Cvoid}, Cint, Cint, Ptr{Cvoid}),
+                  ctx, EVP_CTRL_AEAD_SET_TAG, TAG_BYTES, pointer(ciphertext) + body_len) == 1 || error(openssl_error_text("AEAD tag refused"))
+            rc = ccall((:EVP_DecryptFinal_ex, libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{Cint}),
+                       ctx, pointer(out) + n, outlen)
+            rc == 1 || return false
+            n += Int(outlen[])
+            n == body_len || error("AEAD produced $n bytes for $body_len of ciphertext")
+            true
+        end
     end
-    rc == 0 || throw(AuthenticationError("AEAD tag verification failed"))
-    resize!(out, Int(outlen[]))
+    ok || throw(AuthenticationError("AEAD tag verification failed"))
     return out
 end
 

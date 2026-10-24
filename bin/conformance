@@ -1,0 +1,8 @@
+#!/bin/sh
+# The Julia conformance harness: launches a proxy through the Julia ProtocolProxyManager and checks it against
+# PROTOCOL.md (the counterpart of the Python protocol-proxy-conformance command and of the Go bin/conformance).
+# Usage: conformance <manifest.toml | proxy name> [--echo METHOD] [--tls] [--manager-dials] [--option NAME=VALUE ...]
+#                    [--timeout S] [--python PATH] [--log FILE] [--json] [-v]
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(dirname "$here")
+exec julia --project="$repo" --startup-file=no --history-file=no --color=no "$here/conformance.jl" "$@"

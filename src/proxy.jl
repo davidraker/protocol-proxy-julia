@@ -1,5 +1,5 @@
-# A proxy process (PROTOCOL.md §1, §7, §8): the stdin handshake, registration with the manager, the core methods
-# PING and SET_LOG_LEVEL, the parent watch and the clean stop on SIGTERM.
+# A proxy process (PROTOCOL.md §1, §7, §8, §9): the stdin handshake, registration with the manager, the core methods
+# PING and SET_LOG_LEVEL, LOG batches over the socket, the parent watch and the clean stop on SIGTERM.
 
 const TOKEN_HEX_LENGTH = 32
 const KEY_HEX_LENGTH = 64
@@ -8,12 +8,16 @@ const REGISTRATION_TIMEOUT = 5.0
 const REGISTRATION_RETRY_DELAY = 20.0
 const MANAGER_WATCH_INTERVAL = 1.0
 const HARD_EXIT_GRACE = 15.0
+const LOG_FLUSH_INTERVAL = 0.2
+const LOG_BATCH_SIZE = 64
 
 struct Handshake
     proxy_token::UUID
     manager_token::UUID
     key::Union{Nothing,Vector{UInt8}}
+    tls::Union{Nothing,TlsMaterial}
 end
+Handshake(proxy_token::UUID, manager_token::UUID, key) = Handshake(proxy_token, manager_token, key, nothing)
 
 """Parse 32 hex characters as a UUID (the form the manager writes on stdin)."""
 function uuid_from_hex(s::AbstractString)
@@ -27,11 +31,10 @@ uuid_hex(u::UUID) = string(u.value; base=16, pad=32)
 """
     read_handshake(io; encrypt=false, ipc_tls=false) -> Handshake
 
-The proxy's token, the manager's token (32 hex characters each) and, with `--encrypt true`, the 32-byte key as 64
-hex characters. TLS material is not supported by this port: `ipc_tls` raises.
+The proxy's token, the manager's token (32 hex characters each), with `--encrypt true` the 32-byte key as 64 hex
+characters, and with `--ipc-tls true` one JSON line of TLS material (`{"ca", "cert", "key"}`, PEM).
 """
 function read_handshake(io::IO; encrypt::Bool=false, ipc_tls::Bool=false)
-    ipc_tls && throw(ArgumentError("--ipc-tls is not supported by this port"))
     data = read(io, 2 * TOKEN_HEX_LENGTH)
     length(data) == 2 * TOKEN_HEX_LENGTH ||
         throw(ArgumentError("Expected $(2 * TOKEN_HEX_LENGTH) hex characters (proxy token + manager token) on stdin, got $(length(data)) bytes. Proxies are meant to be launched by a ProtocolProxyManager."))
@@ -45,7 +48,13 @@ function read_handshake(io::IO; encrypt::Bool=false, ipc_tls::Bool=false)
             throw(ArgumentError("--encrypt is set but no $(KEY_BYTES)-byte key followed the tokens on stdin (got $(length(key_hex)) bytes)."))
         key = hex2bytes(String(key_hex))
     end
-    return Handshake(proxy_token, manager_token, key)
+    tls = nothing
+    if ipc_tls
+        line = strip(readline(io))
+        isempty(line) && throw(ArgumentError("--ipc-tls is set but no TLS material (one JSON line) followed on stdin."))
+        tls = parse_tls_material(line)
+    end
+    return Handshake(proxy_token, manager_token, key, tls)
 end
 
 """
@@ -62,6 +71,10 @@ mutable struct Proxy
     exit_code::Int
     parent::Int
     options::Dict{String,String}
+    #: `--socket-logging` (default true): ship log records in LOG batches once registered (§9)
+    socket_logging::Bool
+    log_queue::Union{Nothing,LogQueue}
+    log_task::Union{Nothing,Task}
 end
 
 str2bool(v::AbstractString) = lowercase(strip(v)) in ("1", "true", "t", "yes", "y", "on") ? true :
@@ -69,8 +82,8 @@ str2bool(v::AbstractString) = lowercase(strip(v)) in ("1", "true", "t", "yes", "
     throw(ArgumentError("Expected a boolean value, got $(repr(v))."))
 str2bool(v::Bool) = v
 
-"""The features this proxy advertises in REGISTER_PEER: ping, set_log_level, compress and the AEADs available."""
-default_proxy_features() = vcat(["ping", "set_log_level"], default_features())
+"""The features this proxy advertises in REGISTER_PEER: ping, log, set_log_level, compress and both AEADs."""
+default_proxy_features() = vcat(["ping", "log", "set_log_level"], default_features())
 
 const STANDARD_OPTIONS = ["proxy-id", "proxy-name", "manager-id", "manager-address", "manager-port", "inbound-address",
                           "inbound-port", "encrypt", "cipher", "ipc-tls", "manager-dials", "persistent",
@@ -86,7 +99,7 @@ function Proxy(options::Dict{String,String}, handshake::Handshake; features::Vec
     manager_port = parse(Int, something(getopt("manager-port"), "22801"))
     encrypt = str2bool(something(getopt("encrypt"), "false"))
     ipc_tls = str2bool(something(getopt("ipc-tls"), "false"))
-    ipc_tls && throw(ArgumentError("--ipc-tls is not supported by this port"))
+    socket_logging = str2bool(something(getopt("socket-logging"), "true"))
     manager_dials = str2bool(something(getopt("manager-dials"), "false"))
     persistent = str2bool(something(getopt("persistent"), "false"))
     inbound_port = getopt("inbound-port")
@@ -94,14 +107,18 @@ function Proxy(options::Dict{String,String}, handshake::Handshake; features::Vec
     if encrypt && handshake.key === nothing
         throw(ArgumentError("$name: --encrypt is set but no key was provided on stdin."))
     end
+    if ipc_tls && handshake.tls === nothing
+        throw(ArgumentError("$name: --ipc-tls is set but no TLS material was provided on stdin."))
+    end
     connector = Connector(proxy_id, handshake.proxy_token; name, inbound_address=something(getopt("inbound-address"), "localhost"),
                           inbound_port=inbound_port === nothing ? nothing : parse(Int, inbound_port), persistent,
                           compress_threshold=threshold === nothing ? COMPRESS_THRESHOLD : parse(Int, threshold),
-                          cipher=something(getopt("cipher"), "auto"), features=default_features())
+                          cipher=something(getopt("cipher"), "auto"), features=default_features(),
+                          tls=ipc_tls ? handshake.tls : nothing)
     manager = Peer(manager_id, handshake.manager_token; name="manager",
-                   address=manager_dials ? nothing : (manager_address, manager_port), key=handshake.key)
+                   address=manager_dials ? nothing : (manager_address, manager_port), key=handshake.key, tls=ipc_tls)
     connector.peers[manager_id] = manager
-    p = Proxy(connector, manager, manager_dials, false, false, 0, parent_pid(), options)
+    p = Proxy(connector, manager, manager_dials, false, false, 0, parent_pid(), options, socket_logging, nothing, nothing)
     p.connector.features = features
     register_callback!(connector, (c, h, payload) -> handle_ping(p, h, payload), "PING"; provides_response=true)
     register_callback!(connector, (c, h, payload) -> handle_set_log_level(p, h, payload), "SET_LOG_LEVEL"; provides_response=true)
@@ -206,6 +223,7 @@ function send_registration!(p::Proxy; attempts::Int=REGISTRATION_ATTEMPTS, timeo
         if success
             p.registered = true
             @info "$(p.connector.name): registered with the manager (features $(p.manager.features))."
+            start_socket_logging!(p)
             return true
         end
         if attempt < attempts
@@ -221,12 +239,74 @@ function send_registration!(p::Proxy; attempts::Int=REGISTRATION_ATTEMPTS, timeo
     return false
 end
 
+# ---- logging over the socket (§9, §11a) ------------------------------------------------------------------------------
+
+"""
+Switch the process logger to a `LogQueue` and start the flushing Task, if this proxy was launched by a manager with
+stderr a pipe and `--socket-logging` is on. The switch itself is the first record over the socket.
+"""
+function start_socket_logging!(p::Proxy)
+    logger = PROXY_LOGGER[]
+    (p.socket_logging && logger !== nothing && logger.json && logger.stream === stderr && use_json_channel()) || return false
+    p.log_queue !== nothing && return true
+    queue = LogQueue()
+    p.log_queue = queue
+    logger.queue = queue
+    p.log_task = errormonitor(@async flush_loop(p))
+    @info "$(p.connector.name): logging over the IPC socket from here on."
+    return true
+end
+
+"""Ship a batch every `LOG_FLUSH_INTERVAL` seconds, or as soon as `LOG_BATCH_SIZE` records are waiting."""
+function flush_loop(p::Proxy)
+    queue = p.log_queue
+    while !p.stopping && PROXY_LOGGER[] !== nothing && PROXY_LOGGER[].queue === queue
+        deadline = time() + LOG_FLUSH_INTERVAL
+        while !p.stopping && time() < deadline && length(queue) < LOG_BATCH_SIZE
+            sleep(0.02)
+        end
+        flush_logs!(p)
+    end
+    return
+end
+
+"""Send one LOG batch (no response expected); records that cannot be sent go to stderr."""
+function flush_logs!(p::Proxy)
+    queue = p.log_queue
+    queue === nothing && return
+    records, dropped = drain!(queue, LOG_BATCH_SIZE)
+    (isempty(records) && dropped == 0) && return
+    sent = try
+        send_message(p.connector, p.manager, Message("LOG", batch_payload(records, dropped)); low_priority=true) !== false
+    catch
+        false
+    end
+    sent || foreach(r -> write_json_line(stderr, r), records)
+    return
+end
+
+"""Back to stderr: restore the logger's stream and write whatever is still queued as JSON lines (§9)."""
+function stop_socket_logging!(p::Proxy)
+    queue = p.log_queue
+    queue === nothing && return
+    logger = PROXY_LOGGER[]
+    logger === nothing || logger.queue === queue && (logger.queue = nothing)
+    p.log_queue = nothing
+    task = p.log_task
+    task === nothing || (timedwait(() -> istaskdone(task), 1.0; pollint=0.01); p.log_task = nothing)
+    records, dropped = drain!(queue)
+    foreach(r -> write_json_line(stderr, r), records)
+    dropped == 0 || @warn "$(p.connector.name): dropped $dropped log records (rate or queue limit)."
+    return
+end
+
 # ---- run loop ------------------------------------------------------------------------------------------------------
 
 function stop!(p::Proxy; code::Int=0)
     p.stopping && return
     p.stopping = true
     p.exit_code = code
+    stop_socket_logging!(p)
     stop!(p.connector)
     return
 end
