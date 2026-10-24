@@ -264,7 +264,11 @@ end
 function resolve_ipv4(host::AbstractString)::IPv4
     h = strip(host)
     (isempty(h) || h == "localhost") && return ip"127.0.0.1"
-    parsed = tryparse(IPv4, h)
+    parsed = try
+        IPv4(h)
+    catch
+        nothing
+    end
     parsed === nothing || return parsed
     for addr in getalladdrinfo(String(h))
         addr isa IPv4 && return addr
@@ -443,7 +447,7 @@ function dispatch(c::Connector, conn::Connection, h::Header, payload::Vector{UIn
 end
 
 function run_callback(c::Connector, cb::Callback, h::Header, payload::Vector{UInt8})
-    task = @async cb.f(c, h, payload)
+    task = @async Base.invokelatest(cb.f, c, h, payload)     # handlers may be registered after the serving Tasks started
     done = timedwait(() -> istaskdone(task), cb.timeout; pollint=0.002)
     if done !== :ok
         @warn "$(c.name): handler $(h.method_name) timed out after $(cb.timeout) s"
@@ -514,14 +518,14 @@ end
 is_persistent(c::Connector, peer::Peer) = peer.persistent === nothing ? c.persistent : peer.persistent
 
 """
-    send(c, peer, msg) -> Pending | true | false
+    send_message(c, peer, msg) -> Pending | true | false
 
 Send a message. Returns a `Pending` when a response is expected, `true` when the frame was handed to a connection
 (or a dial Task), `false` when it cannot be attempted. An open persistent connection to the peer is used when
 there is one; otherwise a persistent peer gets one dialled and any other peer gets a connection for this message
 alone. A frame above `persistent_max_frame` takes its own connection when the peer's address is known.
 """
-function send(c::Connector, peer::Peer, msg::Message)
+function send_message(c::Connector, peer::Peer, msg::Message)
     address = peer.address
     link = peer.connection !== nothing && alive(peer.connection) ? peer.connection : nothing
     if address === nothing && link === nothing

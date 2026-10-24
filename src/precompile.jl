@@ -6,7 +6,7 @@ using PrecompileTools
     sender = UUID("11111111-2222-3333-4444-555555555555")
     token = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
     key = collect(UInt8.(0:31))
-    @compile_workload begin
+    @compile_workload Logging.with_logger(Logging.NullLogger()) do
         h = Header(; method_name="PING", request_id=1, sender_id=sender, sender_token=token, response_expected=true)
         raw = pack(h)
         unpack(raw)
@@ -35,12 +35,12 @@ using PrecompileTools
             start_listener!(a); start_listener!(b)
             a.peers[b.proxy_id] = Peer(b.proxy_id, b.token; address=b.bound, features=["compress"])
             b.peers[a.proxy_id] = Peer(a.proxy_id, a.token; address=a.bound, features=["compress"])
-            pending = send(a, a.peers[b.proxy_id], Message("ECHO", payload; response_expected=true))
+            pending = send_message(a, a.peers[b.proxy_id], Message("ECHO", payload; response_expected=true))
             wait_response(pending, 10.0)
             a.peers[b.proxy_id].persistent = true
-            pending = send(a, a.peers[b.proxy_id], Message("ECHO", "{}"; response_expected=true))
+            pending = send_message(a, a.peers[b.proxy_id], Message("ECHO", "{}"; response_expected=true))
             wait_response(pending, 10.0)
-            pending = send(a, a.peers[b.proxy_id], Message("NOPE", "{}"; response_expected=true))
+            pending = send_message(a, a.peers[b.proxy_id], Message("NOPE", "{}"; response_expected=true))
             wait_response(pending, 10.0)
             stop!(a); stop!(b)
             sleep(0.05)

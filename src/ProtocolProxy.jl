@@ -15,7 +15,7 @@ using libsodium_jll
 
 export Header, pack, unpack, header_length, request_id_max, uuid_bytes, uuid_from_bytes
 export compress, decompress, aead_encrypt, aead_decrypt, aes_gcm_available, seal, open_payload, AuthenticationError
-export Connector, Peer, Message, Pending, Callback, register_callback!, unregister_callback!, start_listener!, send,
+export Connector, Peer, Message, Pending, Callback, register_callback!, unregister_callback!, start_listener!, send_message,
        wait_response, stop!, ResponseTimeout
 export Proxy, Handshake, read_handshake, run!, send_registration!, health_report
 export ProxyLogger, install_logger!, set_level!

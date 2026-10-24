@@ -196,7 +196,7 @@ function send_registration!(p::Proxy; attempts::Int=REGISTRATION_ATTEMPTS, timeo
     for attempt in 1:attempts
         success = false
         try
-            result = send(p.connector, p.manager, registration_message(p))
+            result = send_message(p.connector, p.manager, registration_message(p))
             if result isa Pending
                 success = registration_accepted!(p, wait_response(result, timeout))
             end
@@ -208,7 +208,14 @@ function send_registration!(p::Proxy; attempts::Int=REGISTRATION_ATTEMPTS, timeo
             @info "$(p.connector.name): registered with the manager (features $(p.manager.features))."
             return true
         end
-        attempt < attempts && sleep(retry_delay)
+        if attempt < attempts
+            waited = 0.0
+            while !p.stopping && waited < retry_delay
+                sleep(0.1)
+                waited += 0.1
+            end
+        end
+        p.stopping && return false
     end
     @error "$(p.connector.name): unable to register with the manager after $attempts attempts."
     return false
@@ -232,11 +239,28 @@ Start the listener, register, then serve until SIGTERM, the parent's disappearan
 function run!(p::Proxy)
     c = p.connector
     install_signal_handlers() || @warn "$(c.name): no SIGTERM handler installed"
+    watchdog = errormonitor(@async watch(p))
     start_listener!(c)
     if !send_registration!(p)
-        stop!(p; code=1)
-        return 1
+        p.stopping || stop!(p; code=1)
+        wait_stopped(p)
+        return p.exit_code
     end
+    wait_stopped(p)
+    return p.exit_code
+end
+
+function wait_stopped(p::Proxy)
+    while !p.stopping
+        sleep(0.05)
+    end
+    sleep(0.05)     # let connection Tasks wind down
+    return
+end
+
+"""Stop on SIGTERM (polled every 50 ms) or when the parent process changes (checked every second)."""
+function watch(p::Proxy)
+    c = p.connector
     last_watch = time()
     while !p.stopping
         sig = signal_received()
@@ -257,7 +281,7 @@ function run!(p::Proxy)
         end
         sleep(0.05)
     end
-    return p.exit_code
+    return
 end
 
 """Guarantee the process ends after an orderly stop was begun."""
